@@ -1,0 +1,192 @@
+---
+title: "Cell Type Identification"
+format: html
+---
+```{r setup, include=FALSE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+```{r}
+load("data/Seurat-integrated.RData")
+```
+
+## Introduction
+
+Cell type identification is the key step that links unsupervised clusters (arbitrary groupings defined purely by transcriptional similarity) to biologically meaningful identities. Without it, clusters are just numbered groups; with it, each cluster becomes a named population that can be interpreted in the context of liver biology and disease.
+
+We use **scType**, a fully automated, reference-based classifier. scType scores each cluster by comparing the expression of known marker genes against a curated, tissue-specific database (`ScTypeDB_full.xlsx`). No manual thresholding or marker selection is required at this stage, which makes the method fast and reproducible, though it depends on the coverage and quality of the reference database for the tissue of interest.
+
+## Setup
+
+```{r install-packages}
+# CRAN packages not yet installed
+cran_needed <- c("HGNChelper", "openxlsx")
+cran_missing <- cran_needed[!cran_needed %in% installed.packages()[, "Package"]]
+if (length(cran_missing) > 0) install.packages(cran_missing)
+
+# presto (fast Wilcoxon for FindMarkers)
+# r-universe provides binaries for new R versions faster than CRAN
+if (!"presto" %in% installed.packages()[, "Package"]) {
+  install.packages("presto",
+    repos = c("https://immunogenomics.r-universe.dev", "https://cloud.r-project.org")
+  )
+}
+```
+
+```{r source-sctype}
+# scType functions are sourced directly from the authors' GitHub repository
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_wrapper.R")
+```
+
+```{r}
+library(tidyverse)
+library(Seurat)
+library(patchwork)
+library(kableExtra)
+library(HGNChelper)
+library(openxlsx)
+```
+
+## Automated annotation with scType
+
+Three R scripts are sourced directly from the scType GitHub repository: `gene_sets_prepare.R` and `sctype_score_.R` contain the core scoring functions, while `sctype_wrapper.R` provides the high-level `run_sctype()` convenience function that wraps both into a single call.
+
+Before running scType, two preparatory steps are necessary. `DefaultAssay` is switched to `"RNA"` so that the classifier has access to the full gene space — the SCT assay only retains the ~3,000 variable features selected during normalization, which would exclude many marker genes in the database. `JoinLayers` merges the per-sample expression layers that were created during the Harmony integration step (batch-correction method applied in the previous notebook) back into a single matrix, which is the format `sctype_score_` expects.
+
+`run_sctype` then scores each cluster against all liver cell types in `ScTypeDB_full.xlsx`. Setting `scaled = FALSE` tells the function to normalize the data internally rather than assuming it has already been scaled, which is appropriate here since we are passing counts from the RNA assay. The result is stored as a new metadata column named `sctype_classification`.
+
+```{r}
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- JoinLayers(seurat_obj)
+seurat_obj <- run_sctype(seurat_obj,
+                         assay = "RNA",
+                         scaled = FALSE,
+                         known_tissue_type = "Liver",
+                         custom_marker_file = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx",
+                         name = "sctype_classification"
+)
+```
+```{r}
+save(seurat_obj, file= "data/seurat_obj-SCType-v1.RData")
+```
+
+```{r}
+load("data/seurat_obj-SCType-v1.RData")
+```
+```{r}
+Idents(seurat_obj) <- seurat_obj@meta.data$sctype_classification
+DimPlot(seurat_obj, label = TRUE, repel = T) +
+    NoLegend()
+```
+
+The UMAP shows that scType assigned the hepatocyte label to all clusters. This is not necessarily a classification error: hepatocytes make up the large majority of cells in healthy and NASH-affected liver parenchyma, and their marker genes (*ALB*, *CYP3A5*) produce a very strong signal that dominates the ScTypeDB scoring. The minority populations, such as endothelial cells, Kupffer cells, stellate cells, and cholangiocytes are present but their transcriptional signal is diluted across a large hepatocyte background, leaving insufficient contrast for scType to score them above the hepatocyte baseline.
+
+We will try a different approach, setting `scaled = TRUE` so that scType uses z-scored expression (from the `scale.data` slot) to calculate cluster enrichment scores. Z-scoring removes the absolute expression bias: hepatocyte markers may have high raw counts everywhere, but only truly hepatocyte clusters show relative enrichment above the dataset mean.
+To avoid a memory error, we scale only the genes present in the scType liver marker database rather than all variable features — the dense matrix for all features × all cells would require more than 11 GB of RAM.
+
+```{r free-memory}
+# Drop the SCT assay (large, no longer needed) and clear any existing scale.data
+# before the ScaleData step to free as much RAM as possible
+seurat_obj[["SCT"]] <- NULL
+seurat_obj <- DietSeurat(seurat_obj, assays = "RNA", dimreducs = c("pca", "umap", "harmony"))
+gc()
+gc() # second pass can reclaim memory that required more than one GC cycle
+```
+
+```{r}
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- JoinLayers(seurat_obj)
+seurat_obj <- NormalizeData(seurat_obj)
+
+# Scale only the genes used by scType for liver — scaling all variable features
+# creates an 11+ GB dense matrix that exceeds available memory
+db_url <- "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx"
+gs_list <- gene_sets_prepare(db_url, "Liver")
+sctype_genes <- unique(c(unlist(gs_list$gs_positive), unlist(gs_list$gs_negative)))
+genes_to_scale <- intersect(sctype_genes, rownames(seurat_obj))
+seurat_obj <- ScaleData(seurat_obj, features = genes_to_scale)
+
+seurat_obj <- run_sctype(seurat_obj,
+                         assay = "RNA",
+                         scaled = TRUE,
+                         known_tissue_type = "Liver",
+                         custom_marker_file = db_url,
+                         name = "sctype_classification_V2"
+)
+```
+```{r}
+save(seurat_obj, file= "data/seurat_obj-SCType-v2.RData")
+```
+```{r}
+load("data/seurat_obj-SCType-v2.RData")
+```
+```{r}
+Idents(seurat_obj) <- seurat_obj@meta.data$sctype_classification_V2
+DimPlot(seurat_obj, label = TRUE, repel = T) +
+    NoLegend()
+```
+
+```{r}
+table(seurat_obj$sctype_classification_V2, seurat_obj$Tissue)
+table(seurat_obj$sctype_classification_V2, seurat_obj$Patient)
+ table(seurat_obj$seurat_clusters, seurat_obj$sctype_classification_V2)
+```
+
+```{r}
+DimPlot(seurat_obj, label = TRUE, repel = TRUE, split.by = "SampleID", alpha = 0.5, ncol = 2) +
+  NoLegend()
+DimPlot(seurat_obj, label = TRUE, repel = TRUE, split.by = "Tissue", alpha = 0.5, ncol = 2) +
+  NoLegend()
+DimPlot(seurat_obj, label = TRUE, repel = TRUE, split.by = "Condition", alpha = 0.5, ncol = 2) +
+  NoLegend()
+```
+
+When comparing cell type distribution between tumor and adjacent non-tumor tissue, several differences are apparent. The most notable are observed in mast and hematopoietic cells, which are more abundant in adjacent tissue, suggesting a more active inmune microenvironment in non-tumor liver. Hepatocytes, the most abundant cell type in both conditions, form a more compact cluster in adjacent tissue, whereas in tumor tissue this population appears considerably more scattered, consistent with the transcriptional heterogeneity expected in malignant hepatocytes. Kupffer cells show remarkably similar clusters between both tissues, suggesting their transcriptional identity is relatively stable regardless of the tumor context.Cholangiocytes present two distinct clusters in adjacent tissue, while in tumor tissue the second cluster appears considerably reduced, which may reflect a loss of a specific cholagiocyte subpopulation in the tumor microenvironment. 
+When comparing disease conditions (NAFLD vs NASH), additional differences emerge. Cholangiocytes show two different clusters in NAFLD, whereas in NASH the larger of them appears markedly reduced in density. Mast cells are nearly absent in NAFLD, with stellate cells occupying a more prominent transcriptional space in that condition. This could reflect the early fibrogenic activation of stellate cells in NAFLD prior to progression to NASH. Finally, hepatocytes in NASH display a more heterogeneous transcriptional profile, as evidenced by their more dispersed distribution across the UMAP. 
+```{r}
+VlnPlot(seurat_obj,features = "CYP3A5", alpha = 0.01, y.max = 7,
+        split.by = "SampleID")
+```
+
+```{r}
+VlnPlot(seurat_obj,features = "PTPRB", alpha = 0.01, y.max = 7,
+        split.by = "SampleID")
+```
+
+```{r}
+VlnPlot(seurat_obj,features = "STAB2", alpha = 0.01, y.max = 7,
+        split.by = "SampleID")
+```
+
+```{r}
+VlnPlot(seurat_obj,features = "CD163", alpha = 0.01, y.max = 7,
+        split.by = "SampleID")
+```
+
+```{r}
+VlnPlot(seurat_obj,features = "BICC1", alpha = 0.01, y.max = 7,
+        split.by = "SampleID")
+```
+
+```{r}
+VlnPlot(seurat_obj,features = "PRKG1", alpha = 0.01, y.max = 7,
+        split.by = "SampleID")
+```
+
+```{r}
+VlnPlot(seurat_obj,features = "KIT", alpha = 0.01, y.max = 7,
+        split.by = "SampleID")
+```
+
+
+| Marker genes | Cell type |
+|---|---|
+| *CYP3A5*, *ALB* , *APOB*| Hepatocytes |
+| *PTPRB*, *STAB2* | Endothelial cells |
+| *CD163*, *MRC1* |  Kupffer cells |
+| *BICC1*, *PKHD1*, *EPCAM*, *KRT19* | Cholangiocytes |
+| *PDGFD*, *PRKG1*, *ACTA2* | Hepatic stellate cells |
+| *KIT*, *FCER1* | Mast cells | 
+
+

@@ -1,0 +1,226 @@
+---
+title: "Single-nucleus RNA-seq of NASH HCC liver tissue"
+format: html
+---
+```{r setup, include=FALSE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(sctransform)
+library(dplyr)
+library(patchwork)
+library(corrplot)
+library(tidyverse)
+library(compareGroups)
+
+options(future.globals.maxSize = 4 * 1024^3)
+```
+
+## Load data and create Seurat object 
+Both Read10X and ReadMtx are functions in the Seurat R package used to load single-cell RNA-seq count matrices into memory. The primary difference is their expected input format: Read10X expects a native Cell Ranger directory structure,
+whereas ReadMtx allows you to load customized or non-standard files.
+We use Read10X if our data is directly output from 10X Genomics Cell Ranger, where the files are kept together in a single folder and follow native naming conventions. 
+On the other hand, we use ReadMtx if we are downloading bulk/single-cell expression data from databases like GEO, where the files are unzipped, renamed or in separate locations. 
+```{r}
+#load data and create seurat object
+expression_matrix <- ReadMtx(
+    mtx = "data/GSE189175_counts_matrix.mtx.gz",
+    features = "data/GSE189175_counts_features.tsv.gz",
+    cells = "data/GSE189175_counts_barcodes.tsv.gz"
+)
+meta <- read.delim("data/GSE189175_meta_data.tsv.gz", 
+    header = TRUE, row.names = 1)
+     
+seurat_obj <- CreateSeuratObject(
+    counts = expression_matrix, 
+    meta.data = meta
+    )
+rm(expression_matrix)
+gc()
+```
+
+## Visualization of quality
+First, we generate a violin plot to analyze the distribution before any filtering. 
+```{r}
+VlnPlot(seurat_obj, 
+features = c("nFeature_RNA", "nCount_RNA"), 
+group.by = "SampleID",
+alpha = 0.05, 
+ncol = 2)
+```
+
+Across most samples, nFeature_RNA distributions show a wide base concentrated at low values, indicating a substantial fraction of nuclei with limited gene detection. S2_hcc apparently shows the best distribution, with almost no reads at low values.
+For nCount_RNA, the violins appear more flattened across samples, indicating a narrower relative range of total UMI counts. Still, S2_hcc is the least flattened one.
+
+## Inflection Plots
+
+Inflection plots are diagnostic tools used in droplet-based single-cell RNA-seq to distinguish real cells from empty droplets or background ambient RNA. They help identify a threshold between barcodes corresponding to real cells and those that are likely empty droplets or background noise.
+An inflection plot usually shows:
+- The barcode rank (x-axis, in decreasing order of total UMI counts per barcode)
+- The total UMI count per barcode (y-axis)
+Barcodes are ranked from highest to lowest UMI count. The shape of the curve is typically steep initially (real cells with high counts) and then flattens out (empty droplets or noise).
+Key regions in the plot:
+- Left (steep drop): real cells with high transcript counts.
+- Inflection point / knee: a natural drop in total UMI count. This point is used to define a threshold between real cells and background.
+- Right (flat tail): low UMI barcodes, likely empty droplets or ambient RNA.
+How it’s used:
+- Empty droplets: barcodes after the knee point usually correspond to droplets that did not capture a cell, containing only ambient RNA.
+- Background/ambient RNA: these droplets have very low transcript counts and a high mitochondrial content.
+- Multiplets (doublets/triplets): these tend to lie before the inflection point, but with abnormally high counts. They’re not detected by the plot directly, but if a barcode has too many UMIs or genes, it may be flagged as a possible doublet. These are detected better with dedicated tools like DoubletFinder or Scrublet.
+```{r}
+inflections <- CalculateBarcodeInflections(seurat_obj, group.column = "SampleID")
+BarcodeInflectionsPlot(inflections) +
+    scale_x_continuous(trans = "log10")
+rm(inflections)
+```
+
+## Density plots
+
+This density plot for n_features is used to visually detect the lowest and highest thresholds. We want to eliminate those initial peaks where there are low detected genes, as they don't have good quality. They are primarily empty droplets, broken or damaged nuclei, and debris. If we include them in the analysis, they will form their own artificial clusters that do not represent a real cell type.
+```{r}
+features_df <- imap(SplitObject(seurat_obj, split.by = "SampleID"),
+\(x, name) tibble (
+    sample=name, 
+    n_features = x$nFeature_RNA
+)) |> list_rbind()
+ggplot(features_df, aes(n_features, col = sample)) +
+    geom_density() +
+    geom_vline(xintercept = c(400, 500, 1000), linetype = "dashed") +
+    theme_classic()
+```
+
+We observe that there is great heterogeneity between samples. S2_hcc is completely different from the rest, with a defined peak at 2500 and a long tail. Both samples of S1 have two peaks, and the rest of them only have a dominant first peak.
+
+```{r}
+samples_list <- SplitObject(seurat_obj, split.by = "SampleID")
+samples_filtered <- list(
+    S1_ant = subset(samples_list[["S1_ant"]], subset = nFeature_RNA > 400),
+    S1_hcc = subset(samples_list[["S1_hcc"]], subset = nFeature_RNA > 1500),
+    S2_ant = subset(samples_list[["S2_ant"]], subset = nFeature_RNA > 500),
+    S2_hcc = subset(samples_list[["S2_hcc"]], subset = nFeature_RNA > 1000),
+    S3_ant = subset(samples_list[["S3_ant"]], subset = nFeature_RNA > 800),
+    S3_hcc = subset(samples_list[["S3_hcc"]], subset = nFeature_RNA > 500)
+)
+seurat_obj <- merge(samples_filtered[[1]],
+y = samples_filtered[-1],
+add.cell.ids = names(samples_filtered))
+```
+
+How many nuclei have we lost?
+```{r}
+before <- sapply(samples_list, ncol)
+after <- as.numeric(table(seurat_obj$SampleID))
+names <- names(table(seurat_obj$SampleID))
+data.frame(
+    sample = names, 
+    before = before, 
+    after = after, 
+    pct_deleted = round((1 - after/before)*100, 1)
+)
+```
+
+## QC metrics
+
+In addition to the percentage of mitochondrial transcripts, two additional metrics were calculated to assess potential sources of technical contamination relevant to liver tissue.
+- percent_mito (pattern ^MT-) quantifies the percentage of transcripts originating from mitochondrial genes. In single-nucleus RNA-seq, mitochondrial transcripts are not expected to be abundant, since mitochondria are cytoplasmic organelles and should be largely excluded during nuclei isolation. Elevated mitochondrial content can therefore indicate cytoplasmic contamination or compromised nuclear integrity.
+- percent_ribo (pattern ^RP[LS]) reflects the proportion of ribosomal protein gene transcripts, providing a general indicator of translational activity and overall sample quality.
+- percent_hemoglobin (pattern ^HB[^(P|E|S)]) estimates the proportion of hemoglobin gene transcripts, which is particularly relevant for liver tissue given its high degree of vascularization. Elevated hemoglobin signal may indicate residual blood contamination introduced during tissue dissociation.
+```{r}
+seurat_obj[["percent_mito"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+seurat_obj[["percent_ribo"]] <- PercentageFeatureSet(seurat_obj, pattern = "^RP[LS]")
+seurat_obj[["percent_hemoglobin"]] <- PercentageFeatureSet(seurat_obj, pattern = "^HB[^(P|E|S)]")
+md <- c("percent_mito", "percent_ribo", "percent_hemoglobin")
+VlnPlot(seurat_obj, assay = "RNA", log = F,
+group.by = "SampleID", features = md, pt.size = 0.1,alpha = 0.01, ncol = 2)
+```
+
+Both percent_mito and percent_hemoglobin showed no signal across all samples, consistent with successful nuclear isolation free from cytoplasmic and blood contamination. 
+
+## Most expressed genes
+We should have done this step before filtering, to see the raw composition of the samples and identify those genes that dominate before cleaning. Even though we have already filtered, we can still see if there is any gene significantly more expressed.
+```{r}
+seurat_obj <- JoinLayers(seurat_obj)
+C <- seurat_obj[["RNA"]]$counts
+C@x <- C@x / rep.int(colSums(C), diff(C@p)) * 100
+most_expressed <- order(Matrix::rowSums(C), decreasing = T)[20:1]
+boxplot(as.matrix(t(C[most_expressed, ])),
+    cex = 0.1, las = 1, xlab = "Percent counts per cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+```
+
+The 20 most expressed genes were dominated by MALAT1 and NEAT1, two nuclear-enriched long non-coding RNAs, expected to be highly abundant in single-nucleus RNA-seq data. ALB and CYP3A5, canonical hepatocyte markers, ranked among the top expressed genes, confirming successful capture of the predominant liver cell type.
+
+## Normalization
+`SCTransform` replaces the `NormalizeData -> FindVariableFeatures -> ScaleData` workflow. `conserve.memory` trades speed for memory. `gc` releases the memory freed. `RunPCA()` runs principal component analysis on the variable features SCTransform selected (it becomes the default assay automatically), compressing thousands of genes into a smaller set of orthogonal components (50 by default). `RunUMAP(dims = 1:20)` takes the first 20 PCs, which are generally the ones carrying real biological signal rather than noise, and projects them into 2D with UMAP, a nonlinear technique that preserves local neighborhood structure, producing the embedding used to visualize clusters. This UMAP is computed on uncorrected PCA embeddings and is used solely for preliminary quality control visualization. The final UMAP, computed on Harmony-corrected embeddings, is presented in the next chapter.
+```{r}
+seurat_obj <- SCTransform(seurat_obj, conserve.memory = TRUE)
+gc()
+seurat_obj <- RunPCA(seurat_obj)
+seurat_obj <- RunUMAP(seurat_obj, dims= 1:20)
+save (seurat_obj, file= "data/Seurat.RData")
+```
+
+## UMAP visualization and Correlation plot
+```{r}
+load("data/Seurat.RData")
+```
+
+```{r}
+FeaturePlot(seurat_obj, features = c("percent_ribo", "percent_mito", "percent_hemoglobin"))
+```
+
+percent_mito and percent_hemoglobin were negligible across all nuclei, while percent_ribo showed sparse, isolated signal with no clear spatial pattern on the UMAP.
+To further assess nuclear quality, we examined the correlation between percent_ribo, MALAT1 and nFeature. MALAT1 is a gene commonly used as a proxy for nucleus viability, since its expression tends to decrease in damaged or degraded cells.
+```{r}
+MALAT1 <- LayerData(seurat_obj, layer = "scale.data", assay = "SCT")["MALAT1", ]
+mat <- bind_cols(
+    seurat_obj[["percent_ribo"]],
+    MALAT1 = MALAT1, 
+    seurat_obj[["nFeature_RNA"]]
+)
+corr_mat <- cor(mat, method = "p")
+corrplot(corr_mat, title = "Correlation plot", type = "upper")
+```
+
+No meaningful correlation was observed between these three variables, suggesting that gene detection (nFeatures) is not associated with ribosomal content or MALAT1 expression. Combined with the insignificant mitochondrial and hemoglobin percentages observed earlier, this further supports that the nuclei in this dataset are of good quality. 
+
+## Density plots after normalization
+```{r}
+features_df <- imap(SplitObject(seurat_obj, split.by = "SampleID"),
+\(x, name) tibble (
+    sample=name, 
+    n_features = x$nFeature_RNA
+)) |> list_rbind()
+ggplot(features_df, aes(n_features, col = sample)) +
+    geom_density() +
+    theme_classic()
+```
+
+## Compare Groups
+```{r}
+library(knitr)
+
+antes <- sapply(samples_list, ncol)
+despues <- as.numeric(table(seurat_obj$SampleID))
+nombres <- names(table(seurat_obj$SampleID))
+
+summary_table <- data.frame(
+    Sample = nombres,
+    Tissue = c("Adjacent", "Tumor", "Adjacent", "Tumor", "Adjacent", "Tumor"),
+    Patient = c(1, 1, 2, 2, 3, 3),
+    Nuclei_before = antes,
+    Nuclei_after = despues,
+    Pct_removed = round((1 - despues/antes) * 100, 1)
+)
+
+kable(summary_table, 
+      caption = "Summary of nuclei before and after quality control filtering",
+      col.names = c("Sample", "Tissue", "Patient", 
+                    "Nuclei before QC", "Nuclei after QC", "% removed"))
+```
+
+```{r child="02-Integration.qmd"}
+```

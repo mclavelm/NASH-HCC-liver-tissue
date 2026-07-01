@@ -1,0 +1,79 @@
+---
+title: "02-Integration"
+format: html
+---
+
+```{r setup, include=FALSE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+```{r}
+load("data/Seurat.RData")
+```
+```{r}
+library(Seurat)
+library(harmony)
+```
+
+## PCA
+It is already done in the previous chapter, but we are now going to see the genes which contribute more to each PC.
+```{r}
+#Which genes contribute more to each PC
+VizDimLoadings(seurat_obj, dims = 1:4, reduction = "pca")
+
+#How are samples distributed
+DimPlot(seurat_obj, reduction = "pca", group.by = "SampleID")
+```
+
+PC1 separates hepatocytes (CYP3A5) from non-parenchymal cells (LDB2, TCF4). PC2 further resolves endothelial cells (PTPRB) from other non-parenchymal populations. PC3 captures the contrast between macrophages/Kupffer cells (CD163, MRC1) and cholangiocytes (BICC1, PKHD1). PC4 distinguishes liver sinusoidal endothelial cells (STAB2) from hepatic stellate cells (PDGFD, PRKG1), the latter being particularly relevant in the context of NAFLD and liver fibrosis.
+
+```{r}
+DimHeatmap(seurat_obj, dims = 1:20, cells = 500, balanced = TRUE)
+```
+
+Qualitative visual check: for each PC it plots the 500 most extreme cells (ballanced = true takes them from both ends, highest and lowest scoring, seeing the contrast in both directions) against their top leading genes. A PC with real structure shows a clear block pattern, whereas a PC that is just noise lools unstructured. This way, we can visually spot the point where the heatmaps stop looking structured and start looking like noise.  
+```{r}
+ElbowPlot(seurat_obj, ndims = 50)
+```
+
+On the other hand, this plot explains the variance quantitatively. We are looking for where the curve flattens because, beyond that point, each extra PC buys us almost nothing (noise). 
+It is best to use both plots (Elbow and DimHeatmap) because just the elbow can't tell you whether PC 20 is biologically real or just a noisy tail that happens to still show nonzero variance. if the heatmaps for PCs up to ~20 still show clean block structure, that corroborates the elbow's cutoff; if PCs 15-20 already look like static, that's a sign the cutoff should be lower than the elbow alone suggests. 
+
+## Integration
+When working with multiple samples, technical differences between them such as different processing days, sequencing runs, or donor-specific effects can introduce unwanted variation that obscures the biological signal. This is known as a batch effect. Without correcting for it, cells would cluster by sample of origin rather than by cell type in the UMAP.
+To correct for this, we use `Harmony`, which works directly on the PCA embeddings already computed in the previous step. It identifies the sample-specific component of variation in that reduced space and removes it, producing a corrected embedding stored as a new harmony reduction. Importantly, it does not modify the original expression values (RNA or SCT assays), only the way cells are organised in the dimensionality-reduced space.
+An alternative approach is Seurat's anchor-based integration (`SelectIntegrationFeatures`, `PrepSCTIntegration`, `FindIntegrationAnchors`, `IntegrateData`). This method requires a separate Seurat object per sample as input, with SCTransform applied individually to each one. In our case, data were loaded from a single combined count matrix rather than from separate per-sample Cell Ranger outputs, so all samples were merged into a single object from the start. Splitting the object back apart and rerunning SCTransform per sample would have been necessary to use this workflow, which is why we opted for `Harmony` instead: it is fully compatible with the merged, already normalised object we have.
+What does each of the following calls do?
+`RunHarmony` takes the existing PCA embedding and removes the sample-driven component of variation. It works iteratively: soft-cluster cells in PC space compute per-cluster correction vectors that pull each sample's cells in a cluster toward a shared centroid, re-embed, and repeat until convergence. The result is stored as a new "harmony" reduction, a batch-corrected analog of PCA. It doesn't touch the RNA/SCT expression values, only this new coordinate space. 
+`RunUMAP`  projects the first 20 harmony dimensions (the same 1:20 justified earlier by the ElbowPlot/DimHeatmap check) into 2D for visualization. UMAP is nonlinear and preserves local neighborhood structure, so cells that are transcriptionally similar in 20-dimensional harmony space end up near each other on the 2D plot. This is purely visual; the DimPlot(reduction = "umap", ...) calls right after read off of this.
+`FindNeighbors` builds a graph rather than a picture: for each cell, finds its nearest neighbors (by default k=20) in that same 20-dim harmony space, producing a K-nearest-neighbor graph that's then refined into a shared-nearest-neighbor (SNN) graph (edges weighted by how much two cells' neighborhoods overlap). This graph is the actual input to clustering, it has no visual output of its own, it just gets stored on the object.
+`FindClusters` runs graph-based community detection (Louvain by default) on the SNN graph from the previous step, partitioning cells into discrete clusters by optimizing modularity. The resolution parameter (default 0.8) controls granularity: higher values give more, smaller clusters. Results land in seurat_obj$seurat_clusters and are what d1 <- DimPlot and FindAllMarkers operate on afterward. 
+
+```{r}
+seurat_obj <- RunHarmony(seurat_obj,
+group.by.vars= "SampleID")
+
+seurat_obj <- RunUMAP(seurat_obj, 
+reduction = "harmony", 
+dims = 1:20)
+
+seurat_obj <- FindNeighbors(seurat_obj, 
+reduction = "harmony", 
+dims = 1:20)
+
+seurat_obj <- FindClusters(seurat_obj)
+```
+
+```{r}
+save (seurat_obj, file= "data/Seurat-integrated.RData")
+```
+```{r}
+DimPlot(seurat_obj, reduction = "umap", group.by = "SampleID")
+```
+
+In each cloud of the plot there is a mix of all samples, except in one of them, which is almost only S2-hcc. This was the most different sample in the density plot, so we could assume that this sample has cells that are not present in other samples. 
+To better undestand this issolated groups: 
+```{r}
+d1 <- DimPlot(seurat_obj, label = TRUE, repel = TRUE)
+d1
+```
+
